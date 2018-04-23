@@ -156,9 +156,9 @@ def Override(data,
   output['config'] = defaults.get('config', {})
 
   # pytype: disable=attribute-error
-  if options.entrypoint:
+  if options.entrypoint is not None:
     output['config']['Entrypoint'] = options.entrypoint
-  if options.cmd:
+  if options.cmd is not None:
     output['config']['Cmd'] = options.cmd
   if options.user:
     output['config']['User'] = options.user
