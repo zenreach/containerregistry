@@ -13,10 +13,12 @@
 # limitations under the License.
 """This package provides tools for saving docker images."""
 
+from __future__ import absolute_import
+from __future__ import division
 
+from __future__ import print_function
 
-import cStringIO
-import hashlib
+import io
 import json
 import os
 import tarfile
@@ -26,14 +28,21 @@ from containerregistry.client import docker_name
 from containerregistry.client.v1 import docker_image as v1_image
 from containerregistry.client.v1 import save as v1_save
 from containerregistry.client.v2 import v1_compat
+from containerregistry.client.v2_2 import docker_digest
+from containerregistry.client.v2_2 import docker_http
 from containerregistry.client.v2_2 import docker_image as v2_2_image
 from containerregistry.client.v2_2 import v2_compat
+
+import six
 
 
 
 def _diff_id(v1_img, blob):
-  unzipped = v1_img.uncompressed_layer(blob)
-  return 'sha256:' + hashlib.sha256(unzipped).hexdigest()
+  try:
+    return v1_img.diff_id(blob)
+  except ValueError:
+    unzipped = v1_img.uncompressed_layer(blob)
+    return docker_digest.SHA256(unzipped)
 
 
 def multi_image_tarball(
@@ -51,9 +60,10 @@ def multi_image_tarball(
   """
 
   def add_file(filename, contents):
+    contents_bytes = contents.encode('utf8')
     info = tarfile.TarInfo(filename)
-    info.size = len(contents)
-    tar.addfile(tarinfo=info, fileobj=cStringIO.StringIO(contents))
+    info.size = len(contents_bytes)
+    tar.addfile(tarinfo=info, fileobj=io.BytesIO(contents_bytes))
 
   tag_to_v1_image = tag_to_v1_image or {}
 
@@ -68,9 +78,9 @@ def multi_image_tarball(
   #             is loaded.
   manifests = []
 
-  for (tag, image) in tag_to_image.iteritems():
+  for (tag, image) in six.iteritems(tag_to_image):
     # The config file is stored in a blob file named with its digest.
-    digest = hashlib.sha256(image.config_file()).hexdigest()
+    digest = docker_digest.SHA256(image.config_file().encode('utf8'), '')
     add_file(digest + '.json', image.config_file())
 
     cfg = json.loads(image.config_file())
@@ -83,7 +93,7 @@ def multi_image_tarball(
       tag_to_v1_image[tag] = v1_img
 
     # Add the manifests entry for this image.
-    manifests.append({
+    manifest = {
         'Config':
             digest + '.json',
         'Layers': [
@@ -91,10 +101,25 @@ def multi_image_tarball(
             # We don't just exclude the empty tar because we leave its diff_id
             # in the set when coming through v2_compat.V22FromV2
             for layer_id in reversed(v1_img.ancestry(v1_img.top()))
-            if _diff_id(v1_img, layer_id) in diffs
+            if _diff_id(v1_img, layer_id) in diffs and
+            not json.loads(v1_img.json(layer_id)).get('throwaway')
         ],
         'RepoTags': [str(tag)]
-    })
+    }
+
+    layer_sources = {}
+    input_manifest = json.loads(image.manifest())
+    input_layers = input_manifest['layers']
+
+    for input_layer in input_layers:
+      if input_layer['mediaType'] == docker_http.FOREIGN_LAYER_MIME:
+        diff_id = image.digest_to_diff_id(input_layer['digest'])
+        layer_sources[diff_id] = input_layer
+
+    if layer_sources:
+      manifest['LayerSources'] = layer_sources
+
+    manifests.append(manifest)
 
   # v2.2 tarballs are a superset of v1 tarballs, so delegate
   # to v1 to save itself.
@@ -144,14 +169,15 @@ def fast(image, directory,
 
   def write_file(name, accessor,
                  arg):
-    with open(name, 'wb') as f:
+    with io.open(name, u'wb') as f:
       f.write(accessor(arg))
 
   with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
     future_to_params = {}
     config_file = os.path.join(directory, 'config.json')
     f = executor.submit(write_file, config_file,
-                        lambda unused: image.config_file(), 'unused')
+                        lambda unused: image.config_file().encode('utf8'),
+                        'unused')
     future_to_params[f] = config_file
 
     idx = 0
@@ -163,7 +189,7 @@ def fast(image, directory,
           write_file,
           digest_name,
           # Strip the sha256: prefix
-          lambda blob: blob[7:],
+          lambda blob: blob[7:].encode('utf8'),
           blob)
       future_to_params[f] = digest_name
 
@@ -183,8 +209,7 @@ def fast(image, directory,
 
 def uncompressed(image,
                  directory,
-                 threads = 1
-                ):
+                 threads = 1):
   """Produce a format similar to `fast()`, but with uncompressed blobs.
 
   After calling this, the following filesystem will exist:
@@ -212,14 +237,15 @@ def uncompressed(image,
 
   def write_file(name, accessor,
                  arg):
-    with open(name, 'wb') as f:
+    with io.open(name, u'wb') as f:
       f.write(accessor(arg))
 
   with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
     future_to_params = {}
     config_file = os.path.join(directory, 'config.json')
     f = executor.submit(write_file, config_file,
-                        lambda unused: image.config_file(), 'unused')
+                        lambda unused: image.config_file().encode('utf8'),
+                        'unused')
     future_to_params[f] = config_file
 
     idx = 0
@@ -231,7 +257,7 @@ def uncompressed(image,
           write_file,
           digest_name,
           # Strip the sha256: prefix
-          lambda diff_id: diff_id[7:],
+          lambda diff_id: diff_id[7:].encode('utf8'),
           diff_id)
       future_to_params[f] = digest_name
 
